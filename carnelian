@@ -91,19 +91,63 @@ fi
 
 # --- Signer -------------------------------------------------------------------
 
+# nak's bunker client waits forever if any relay named in the bunker link never
+# connects, so drop the ones that do not answer within a few seconds. Prints
+# the rewritten link.
+prune_bunker_relays() {
+    local url="$1" base query out=() keep=() r decoded pids=() i
+    base="${url%%\?*}"
+    query="${url#*\?}"
+    [ "$query" != "$url" ] || { printf '%s\n' "$url"; return 0; }
+
+    local params=() relays=()
+    IFS='&' read -r -a params <<<"$query"
+    for r in "${params[@]}"; do
+        case "$r" in
+            relay=*) relays+=("$r") ;;
+            *) out+=("$r") ;;
+        esac
+    done
+    [ ${#relays[@]} -gt 1 ] || { printf '%s\n' "$url"; return 0; }
+
+    local tmp
+    tmp=$(mktemp -d)
+    for i in "${!relays[@]}"; do
+        decoded=$(python3 -c 'import sys,urllib.parse; print(urllib.parse.unquote(sys.argv[1]))' "${relays[$i]#relay=}")
+        ( timeout "${CARNELIAN_RELAY_PROBE_SECONDS:-6}" nak req -k 24133 --limit 1 "$decoded" >/dev/null 2>&1 \
+            && touch "$tmp/$i" ) &
+        pids+=($!)
+    done
+    wait "${pids[@]}" 2>/dev/null || true
+    for i in "${!relays[@]}"; do
+        if [ -e "$tmp/$i" ]; then
+            keep+=("${relays[$i]}")
+        else
+            echo "Skipping unreachable signer relay: $(python3 -c 'import sys,urllib.parse; print(urllib.parse.unquote(sys.argv[1]))' "${relays[$i]#relay=}")" >&2
+        fi
+    done
+    rm -rf "$tmp"
+    [ ${#keep[@]} -gt 0 ] || keep=("${relays[@]}")   # nothing answered; let nak try them all
+    local IFS='&'
+    printf '%s?%s\n' "$base" "${keep[*]}${out[*]:+&${out[*]}}"
+}
+
 # Exports NOSTR_SECRET_KEY (and NOSTR_CLIENT_KEY for bunkers) from the config
 # directory unless the environment already provides a key. Prints which one
 # is in use. Returns 1 when nothing is configured, in which case nak prompts.
 load_signer() {
     if [ -n "${NOSTR_SECRET_KEY:-}" ]; then
         case "$NOSTR_SECRET_KEY" in
-            bunker://*) SIGNER_DESC="bunker from the environment" ;;
+            bunker://*)
+                NOSTR_SECRET_KEY=$(prune_bunker_relays "$NOSTR_SECRET_KEY")
+                export NOSTR_SECRET_KEY
+                SIGNER_DESC="bunker from the environment" ;;
             *) SIGNER_DESC="key from the environment" ;;
         esac
         return 0
     fi
     if [ -s "$BUNKER_FILE" ]; then
-        NOSTR_SECRET_KEY=$(tr -d '[:space:]' <"$BUNKER_FILE")
+        NOSTR_SECRET_KEY=$(prune_bunker_relays "$(tr -d '[:space:]' <"$BUNKER_FILE")")
         export NOSTR_SECRET_KEY
         if [ -s "$CLIENT_KEY_FILE" ]; then
             NOSTR_CLIENT_KEY=$(tr -d '[:space:]' <"$CLIENT_KEY_FILE")
@@ -158,6 +202,8 @@ cmd_setup() {
         out=$(opal bunker --name "$APP_NAME" --policy "$policy" 2>&1) || die "opal bunker failed: $out"
         uri=$(grep -oE 'bunker://[^[:space:]"]+' <<<"$out" | head -1)
         [ -n "$uri" ] || die "could not find a bunker:// link in opal's output: $out"
+        echo "Checking the signer relays..."
+        uri=$(prune_bunker_relays "$uri")
         printf '%s\n' "$uri" >"$BUNKER_FILE"
         chmod 600 "$BUNKER_FILE"
         echo "Bunker:      wrote $BUNKER_FILE (policy: $policy)"
@@ -416,7 +462,10 @@ PYEOF
     # nak treats a piped stdin as event input, so keep stdin off a pipe. The key
     # prompt reads the terminal directly.
     if [ "$have_signer" -eq 1 ]; then
-        nak event -k 30023 -d "$slug" "${tag_args[@]}" -c "@$body" "${RELAYS[@]}" </dev/null
+        if ! timeout "${CARNELIAN_PUBLISH_TIMEOUT:-120}" \
+            nak event -k 30023 -d "$slug" "${tag_args[@]}" -c "@$body" "${RELAYS[@]}" </dev/null; then
+            die "publishing failed or timed out. Is Opal unlocked, and did you answer its approval dialog?"
+        fi
     else
         nak event --prompt-sec -k 30023 -d "$slug" "${tag_args[@]}" -c "@$body" "${RELAYS[@]}" </dev/tty
     fi

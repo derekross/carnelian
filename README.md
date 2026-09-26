@@ -72,6 +72,12 @@ CARNELIAN_RELAYS="wss://relay.primal.net wss://relay.damus.io"
 
 `~/.config/carnelian/bunker` holds the Opal link and `~/.config/carnelian/client-key` the client key. Delete both and rerun `carnelian setup` to pair again, then revoke the old Carnelian entry in Opal.
 
+## Troubleshooting
+
+- **Publishing hangs, and Opal shows Carnelian as "waiting for app".** One of the relays in the bunker link is not reachable from your machine, and nak's NIP-46 client waits on every relay in the link. Carnelian probes each relay for a few seconds before connecting and drops the ones that do not answer, printing `Skipping unreachable signer relay: ...`. If that still fails, run `carnelian status`, or edit the relays in `~/.config/carnelian/bunker`.
+- **"publishing failed or timed out".** Opal is locked, or its approval dialog was not answered within the two-minute window. Unlock Opal, run it again, and answer the dialog.
+- **Opal shows a duplicate Carnelian.** `carnelian setup` was rerun after the bunker file was deleted. Revoke the older entry in Opal's Apps list.
+
 ## Uninstall
 
 ```sh
