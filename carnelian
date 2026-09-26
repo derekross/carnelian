@@ -6,13 +6,18 @@
 #   carnelian [file.md] [options]     Publish a file, or the file open in Omawrite.
 #   carnelian setup [--policy P] [--relay URL]...
 #                                   Pair with the Opal signer (NIP-46).
+#   carnelian refresh               Re-fetch your relay list (NIP-65) and Blossom
+#                                   server list (BUD-03) and cache them.
 #   carnelian test                  Sign a throwaway note through the signer; send nothing.
-#   carnelian status                Show the signer and config in use.
+#   carnelian status                Show the signer, relays, servers and file in use.
 #
 # Options:
-#   --dry-run          Build and print the event; sign nothing, send nothing.
+#   --dry-run          Build and print the event; sign, upload and send nothing.
 #   --slug <slug>      Override the article slug (the NIP-33 "d" tag).
-#   --relay <url>      Publish to this relay instead of the configured ones. Repeatable.
+#   --relay <url>      Publish to this relay instead of the resolved ones. Repeatable.
+#   --server <url>     Upload images to this Blossom server instead. Repeatable.
+#   --rewrite-links    After uploading, write the Blossom URLs back into the
+#                      markdown file (a .bak copy is kept).
 #   --yes, -y          Skip the confirmation prompt.
 #   -h, --help         This text.
 #
@@ -21,21 +26,28 @@
 #   ---
 #   title: Goodbye Dock
 #   summary: One paragraph shown in feeds.
-#   image: https://example.com/cover.png
+#   image: cover.png                  # local path or URL
 #   tags: [omarchy, linux]
 #   slug: omarchy-goodbye-dock
 #   date: 2026-09-23
 #   ---
 #
 # Fallbacks when a field is missing:
-#   title      the first "# Heading" in the file
+#   title      the first "# Heading", else the filename prettified
 #   slug       the filename without a YYYY-MM-DD- prefix and the .md suffix
 #   date       the YYYY-MM-DD prefix of the filename, else now
 #   summary    the first paragraph after the title, trimmed to 300 characters
 #
-# The leading H1 is removed from the body because clients render the title
-# tag. Publishing the same slug again replaces the earlier version on relays,
-# so an edit is just a rerun.
+# Images that point at local files (relative to the markdown file) are uploaded
+# to your Blossom servers before publishing and the links are swapped for the
+# blob URLs in the published body. Uploads are content addressed, so a rerun
+# never uploads the same file twice.
+#
+# Where relays and servers come from, first match wins:
+#   --relay / --server on the command line
+#   CARNELIAN_RELAYS / CARNELIAN_BLOSSOM_SERVERS in ~/.config/carnelian/config
+#   your own NIP-65 write relays and BUD-03 server list, cached by `refresh`
+#   a small built-in relay list (there is no built-in server list)
 #
 # Signing, in order of preference:
 #   1. NOSTR_SECRET_KEY in the environment (nsec, hex, ncryptsec or bunker://)
@@ -48,15 +60,20 @@ CONFIG_DIR="${CARNELIAN_CONFIG_DIR:-$HOME/.config/carnelian}"
 CONFIG_FILE="$CONFIG_DIR/config"
 BUNKER_FILE="$CONFIG_DIR/bunker"
 CLIENT_KEY_FILE="$CONFIG_DIR/client-key"
+PROFILE_FILE="$CONFIG_DIR/profile.json"
+UPLOADS_FILE="$CONFIG_DIR/uploads.json"
 OMAWRITE_STATE_DIR="$HOME/.local/share/Omacom/omawrite"
+OMAWRITE_CONF="$HOME/.config/Omacom/omawrite.conf"
 APP_NAME="Carnelian"
+PROFILE_MAX_AGE="${CARNELIAN_PROFILE_MAX_AGE:-86400}"
+CONNECT_TIMEOUT="${CARNELIAN_CONNECT_TIMEOUT:-10s}"
 
+# Used only when you have no NIP-65 list and no config.
 DEFAULT_RELAYS=(
     "wss://relay.primal.net"
     "wss://relay.damus.io"
     "wss://relay.ditto.pub"
     "wss://nos.lol"
-    "wss://relay.snort.social"
 )
 
 # Relays the signer and Carnelian talk over (NIP-46). Small, reliable, and
@@ -67,8 +84,17 @@ SIGNER_RELAYS=(
     "wss://relay.primal.net"
 )
 
+# Where relay lists and server lists are looked up.
+BOOTSTRAP_RELAYS=(
+    "wss://purplepag.es"
+    "wss://relay.damus.io"
+    "wss://relay.primal.net"
+    "wss://relay.ditto.pub"
+    "wss://nos.lol"
+)
+
 usage() {
-    sed -n '3,42p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,58p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-1}"
 }
 
@@ -88,15 +114,18 @@ install_hint() {
     esac
 }
 
+# nak with a connect timeout, as an array so it also works under `timeout`.
+NAK=(nak --connect-timeout "$CONNECT_TIMEOUT")
+
 # --- Config -------------------------------------------------------------------
 
-RELAYS=()
+CONFIG_RELAYS=()
+CONFIG_SERVERS=()
 if [ -f "$CONFIG_FILE" ]; then
     # shellcheck disable=SC1090
     source "$CONFIG_FILE"
-    if [ -n "${CARNELIAN_RELAYS:-}" ]; then
-        read -r -a RELAYS <<<"$CARNELIAN_RELAYS"
-    fi
+    [ -n "${CARNELIAN_RELAYS:-}" ] && read -r -a CONFIG_RELAYS <<<"$CARNELIAN_RELAYS"
+    [ -n "${CARNELIAN_BLOSSOM_SERVERS:-}" ] && read -r -a CONFIG_SERVERS <<<"$CARNELIAN_BLOSSOM_SERVERS"
 fi
 
 # --- Signer -------------------------------------------------------------------
@@ -124,7 +153,7 @@ prune_bunker_relays() {
     tmp=$(mktemp -d)
     for i in "${!relays[@]}"; do
         decoded=$(python3 -c 'import sys,urllib.parse; print(urllib.parse.unquote(sys.argv[1]))' "${relays[$i]#relay=}")
-        ( timeout "${CARNELIAN_RELAY_PROBE_SECONDS:-15}" nak --connect-timeout "${CARNELIAN_CONNECT_TIMEOUT:-10s}" req -k 24133 --limit 1 "$decoded" >/dev/null 2>&1 \
+        ( timeout "${CARNELIAN_RELAY_PROBE_SECONDS:-15}" "${NAK[@]}" req -k 24133 --limit 1 "$decoded" >/dev/null 2>&1 \
             && touch "$tmp/$i" ) &
         pids+=($!)
     done
@@ -143,9 +172,11 @@ prune_bunker_relays() {
 }
 
 # Exports NOSTR_SECRET_KEY (and NOSTR_CLIENT_KEY for bunkers) from the config
-# directory unless the environment already provides a key. Prints which one
-# is in use. Returns 1 when nothing is configured, in which case nak prompts.
+# directory unless the environment already provides a key. Sets SIGNER_DESC.
+# Returns 1 when nothing is configured, in which case nak prompts.
+SIGNER_LOADED=0
 load_signer() {
+    case "$SIGNER_LOADED" in 1) return 0 ;; 2) return 1 ;; esac
     if [ -n "${NOSTR_SECRET_KEY:-}" ]; then
         case "$NOSTR_SECRET_KEY" in
             bunker://*)
@@ -154,9 +185,12 @@ load_signer() {
                 SIGNER_DESC="bunker from the environment" ;;
             *) SIGNER_DESC="key from the environment" ;;
         esac
+        SIGNER_LOADED=1
         return 0
     fi
     if [ -s "$BUNKER_FILE" ]; then
+        check_perms "$BUNKER_FILE"
+        check_perms "$CLIENT_KEY_FILE"
         NOSTR_SECRET_KEY=$(prune_bunker_relays "$(tr -d '[:space:]' <"$BUNKER_FILE")")
         export NOSTR_SECRET_KEY
         if [ -s "$CLIENT_KEY_FILE" ]; then
@@ -164,9 +198,11 @@ load_signer() {
             export NOSTR_CLIENT_KEY
         fi
         SIGNER_DESC="Opal (NIP-46) via $BUNKER_FILE"
+        SIGNER_LOADED=1
         return 0
     fi
     SIGNER_DESC="none configured; nak will prompt for a key"
+    SIGNER_LOADED=2
     return 1
 }
 
@@ -175,6 +211,117 @@ check_perms() {
     [ -e "$f" ] || return 0
     perms=$(stat -c %a "$f")
     [ "$perms" = 600 ] || [ "$perms" = 400 ] || die "$f must be mode 600 (is $perms). Fix with: chmod 600 '$f'"
+}
+
+# --- Profile: who you are, your relays, your servers --------------------------
+
+# The signer's pubkey as hex: config, the cached profile, Opal's active
+# account, or derived from a plain secret key. Fails when unknown.
+pubkey_hex() {
+    local pk="${CARNELIAN_PUBKEY:-}"
+    [ -n "$pk" ] || pk=$(jq -r '.pubkey // empty' "$PROFILE_FILE" 2>/dev/null || true)
+    if [ -z "$pk" ] && command -v opal >/dev/null 2>&1; then
+        pk=$(opal status 2>/dev/null | grep -oE 'npub1[0-9a-z]+' | head -1 || true)
+    fi
+    if [ -z "$pk" ] && [ -n "${NOSTR_SECRET_KEY:-}" ] && [[ "$NOSTR_SECRET_KEY" != bunker://* ]]; then
+        pk=$(nak key public "$NOSTR_SECRET_KEY" 2>/dev/null || true)
+    fi
+    case "$pk" in
+        npub1*) pk=$(nak decode "$pk" 2>/dev/null | grep -oE '[0-9a-f]{64}' | head -1 || true) ;;
+    esac
+    [[ "$pk" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s' "$pk"
+}
+
+# Remember the pubkey once a signature has revealed it (bunker users).
+remember_pubkey() {
+    local pk="$1"
+    [[ "$pk" =~ ^[0-9a-f]{64}$ ]] || return 0
+    umask 077
+    mkdir -p "$CONFIG_DIR"
+    if [ -s "$PROFILE_FILE" ]; then
+        jq --arg pk "$pk" '.pubkey = $pk' "$PROFILE_FILE" >"$PROFILE_FILE.tmp" && mv "$PROFILE_FILE.tmp" "$PROFILE_FILE"
+    else
+        jq -n --arg pk "$pk" '{pubkey: $pk}' >"$PROFILE_FILE"
+    fi
+}
+
+profile_age() {
+    local fetched
+    fetched=$(jq -r '.fetched_at // 0' "$PROFILE_FILE" 2>/dev/null || echo 0)
+    echo $(( $(date +%s) - fetched ))
+}
+
+# Fetch kind 10002 (NIP-65) and kind 10063 (BUD-03) and cache them.
+cmd_refresh() {
+    need nak jq
+    local quiet=0
+    [ "${1:-}" = "--quiet" ] && quiet=1
+    local pk
+    pk=$(pubkey_hex) || die "your pubkey is not known yet. Run 'carnelian test' once, or set CARNELIAN_PUBKEY in $CONFIG_FILE."
+
+    local relays_ev servers_ev
+    relays_ev=$(timeout 30 "${NAK[@]}" req -k 10002 -a "$pk" --limit 1 "${BOOTSTRAP_RELAYS[@]}" 2>/dev/null \
+        | jq -sc 'map(select(.kind == 10002)) | max_by(.created_at) // empty' || true)
+    servers_ev=$(timeout 30 "${NAK[@]}" req -k 10063 -a "$pk" --limit 1 "${BOOTSTRAP_RELAYS[@]}" 2>/dev/null \
+        | jq -sc 'map(select(.kind == 10063)) | max_by(.created_at) // empty' || true)
+
+    umask 077
+    mkdir -p "$CONFIG_DIR"
+    jq -n --arg pk "$pk" --argjson now "$(date +%s)" \
+        --argjson relays "${relays_ev:-null}" --argjson servers "${servers_ev:-null}" '
+        def rtags: ($relays.tags // []) | map(select(.[0] == "r"));
+        {
+          pubkey: $pk,
+          fetched_at: $now,
+          write_relays: (rtags | map(select((length == 2) or (.[2] == "write")) | .[1]) | unique),
+          read_relays:  (rtags | map(select((length == 2) or (.[2] == "read"))  | .[1]) | unique),
+          blossom_servers: (($servers.tags // []) | map(select(.[0] == "server") | .[1] | rtrimstr("/")) | unique),
+          relay_list_at: ($relays.created_at // null),
+          server_list_at: ($servers.created_at // null)
+        }' >"$PROFILE_FILE.tmp" && mv "$PROFILE_FILE.tmp" "$PROFILE_FILE"
+
+    if [ "$quiet" -eq 0 ]; then
+        echo "Pubkey:          $(nak encode npub "$pk" 2>/dev/null || echo "$pk")"
+        echo "Write relays:    $(jq -r '.write_relays | if length == 0 then "<none published>" else join(" ") end' "$PROFILE_FILE")"
+        echo "Blossom servers: $(jq -r '.blossom_servers | if length == 0 then "<none published>" else join(" ") end' "$PROFILE_FILE")"
+        echo "Saved to $PROFILE_FILE"
+    fi
+}
+
+# Refresh before a publish when the cache is missing or stale. Never fatal: a
+# network hiccup should not block publishing.
+maybe_refresh() {
+    if [ ! -s "$PROFILE_FILE" ] || [ "$(profile_age)" -gt "$PROFILE_MAX_AGE" ]; then
+        if pubkey_hex >/dev/null 2>&1; then
+            echo "Refreshing your relay and server lists..."
+            cmd_refresh --quiet || echo "Warning: could not refresh lists; using what is cached." >&2
+        fi
+    fi
+}
+
+resolve_relays() {
+    local -n _out=$1
+    shift
+    if [ $# -gt 0 ]; then _out=("$@"); RELAY_SOURCE="command line"
+    elif [ ${#CONFIG_RELAYS[@]} -gt 0 ]; then _out=("${CONFIG_RELAYS[@]}"); RELAY_SOURCE="config"
+    else
+        mapfile -t _out < <(jq -r '.write_relays[]?' "$PROFILE_FILE" 2>/dev/null || true)
+        if [ ${#_out[@]} -gt 0 ]; then RELAY_SOURCE="your NIP-65 write relays"
+        else _out=("${DEFAULT_RELAYS[@]}"); RELAY_SOURCE="built-in defaults"; fi
+    fi
+}
+
+resolve_servers() {
+    local -n _out=$1
+    shift
+    if [ $# -gt 0 ]; then _out=("$@"); SERVER_SOURCE="command line"
+    elif [ ${#CONFIG_SERVERS[@]} -gt 0 ]; then _out=("${CONFIG_SERVERS[@]}"); SERVER_SOURCE="config"
+    else
+        mapfile -t _out < <(jq -r '.blossom_servers[]?' "$PROFILE_FILE" 2>/dev/null || true)
+        if [ ${#_out[@]} -gt 0 ]; then SERVER_SOURCE="your BUD-03 server list"
+        else SERVER_SOURCE="none"; fi
+    fi
 }
 
 # --- setup --------------------------------------------------------------------
@@ -193,7 +340,7 @@ cmd_setup() {
         esac
         shift
     done
-    need nak opal
+    need nak opal jq
 
     umask 077
     mkdir -p "$CONFIG_DIR"
@@ -211,10 +358,10 @@ cmd_setup() {
         echo "             Delete it and rerun setup to pair again (then revoke the old '$APP_NAME' in Opal)."
     else
         opal status >/dev/null 2>&1 || die "Opal is not running or not reachable. Start it, then rerun setup."
-        local out uri
         [ ${#signer_relays[@]} -gt 0 ] || signer_relays=("${SIGNER_RELAYS[@]}")
         local relay_args=() r
         for r in "${signer_relays[@]}"; do relay_args+=(--relay "$r"); done
+        local out uri
         out=$(opal bunker --name "$APP_NAME" --policy "$policy" "${relay_args[@]}" 2>&1) || die "opal bunker failed: $out"
         uri=$(grep -oE 'bunker://[^[:space:]"]+' <<<"$out" | head -1)
         [ -n "$uri" ] || die "could not find a bunker:// link in opal's output: $out"
@@ -229,12 +376,24 @@ cmd_setup() {
     if [ ! -f "$CONFIG_FILE" ]; then
         cat >"$CONFIG_FILE" <<EOF
 # Carnelian configuration. Sourced by bash.
-# Relays to publish to, space separated. Leave unset for the defaults.
+#
+# Relays to publish to, space separated. Unset to use your NIP-65 write relays.
 # CARNELIAN_RELAYS="wss://relay.primal.net wss://relay.damus.io"
+#
+# Blossom servers for images, space separated, first one is uploaded to and the
+# rest mirror it. Unset to use your published server list (kind 10063).
+# CARNELIAN_BLOSSOM_SERVERS="https://blossom.example.com"
+#
+# Your pubkey (npub or hex), only needed when it cannot be discovered.
+# CARNELIAN_PUBKEY="npub1..."
 EOF
         chmod 600 "$CONFIG_FILE"
         echo "Config:      wrote $CONFIG_FILE"
     fi
+
+    echo ""
+    echo "Fetching your relay and Blossom server lists..."
+    cmd_refresh || true
 
     echo ""
     echo "Paired with Opal as '$APP_NAME'. The first publish opens Opal's approval"
@@ -245,19 +404,18 @@ EOF
 # --- test ---------------------------------------------------------------------
 
 cmd_test() {
-    need nak
+    need nak jq
     load_signer || die "no signer configured. Run: carnelian setup"
-    check_perms "$BUNKER_FILE"
-    check_perms "$CLIENT_KEY_FILE"
     echo "Signer: $SIGNER_DESC"
     echo "Asking the signer for a signature on a throwaway note. Nothing is sent to any relay."
     local out
     if ! out=$(timeout "${CARNELIAN_PUBLISH_TIMEOUT:-120}" \
-            nak --connect-timeout "${CARNELIAN_CONNECT_TIMEOUT:-10s}" event -k 1 -c "Carnelian signer test $(date +%s) (never published)" </dev/null); then
+            "${NAK[@]}" event -k 1 -c "Carnelian signer test $(date +%s) (never published)" </dev/null); then
         die "the signer did not answer. Is Opal unlocked, and did you approve the request?"
     fi
     local pk
     pk=$(jq -r '.pubkey' <<<"$out")
+    remember_pubkey "$pk"
     echo "Signed by: $(nak encode npub "$pk" 2>/dev/null || echo "$pk")"
     echo "OK: the signer works."
 }
@@ -266,13 +424,28 @@ cmd_test() {
 
 cmd_status() {
     load_signer || true
-    echo "Signer:  $SIGNER_DESC"
+    echo "Signer:   $SIGNER_DESC"
     if [ -s "$CLIENT_KEY_FILE" ]; then
-        echo "Client:  $(nak key public "$(tr -d '[:space:]' <"$CLIENT_KEY_FILE")" 2>/dev/null || echo "$CLIENT_KEY_FILE")"
+        echo "Client:   $(nak key public "$(tr -d '[:space:]' <"$CLIENT_KEY_FILE")" 2>/dev/null || echo "$CLIENT_KEY_FILE")"
     fi
-    echo "Relays:  ${RELAYS[*]:-${DEFAULT_RELAYS[*]}}"
+    local pk
+    if pk=$(pubkey_hex); then
+        echo "Pubkey:   $(nak encode npub "$pk" 2>/dev/null || echo "$pk")"
+    else
+        echo "Pubkey:   unknown (run 'carnelian test' once)"
+    fi
+    local relays=() servers=()
+    resolve_relays relays
+    resolve_servers servers
+    echo "Relays:   ${relays[*]} ($RELAY_SOURCE)"
+    echo "Servers:  ${servers[*]:-<none>} ($SERVER_SOURCE)"
+    if [ -s "$PROFILE_FILE" ] && [ "$(jq -r '.fetched_at // empty' "$PROFILE_FILE")" != "" ]; then
+        echo "Lists:    cached $(( $(profile_age) / 60 )) min ago in $PROFILE_FILE"
+    else
+        echo "Lists:    not fetched yet (carnelian refresh)"
+    fi
     if command -v opal >/dev/null 2>&1; then
-        echo "Opal:    $(opal status 2>/dev/null | head -1 | sed 's/^Signer: *//' || echo 'not reachable')"
+        echo "Opal:     $(opal status 2>/dev/null | head -1 | sed 's/^Signer: *//' || echo 'not reachable')"
     fi
     local open
     open=$(omawrite_open_file 2>/dev/null || true)
@@ -284,8 +457,6 @@ cmd_status() {
 # Omawrite only writes recovery-N.json while a document has unsaved changes, so
 # the open file has to come from the window title ("* name.md - Omawrite" when
 # modified) plus Omawrite's last save directory.
-
-OMAWRITE_CONF="$HOME/.config/Omacom/omawrite.conf"
 
 omawrite_title() {
     local active
@@ -339,22 +510,79 @@ print(urllib.parse.unquote(u[7:]) if u.startswith("file://") else "")')
     return 1
 }
 
+# --- Images -------------------------------------------------------------------
+
+# Upload one local file to the first server and mirror it to the rest. Prints
+# the blob URL. Uses the uploads cache keyed by sha256 so reruns are free.
+upload_image() {
+    local path="$1" sha="$2" ext="$3"
+    shift 3
+    local servers=("$@") url="" primary="${servers[0]}" s
+
+    if [ -s "$UPLOADS_FILE" ]; then
+        url=$(jq -r --arg sha "$sha" '.[$sha] // empty' "$UPLOADS_FILE")
+    fi
+
+    if [ -z "$url" ]; then
+        if "${NAK[@]}" blossom check -s "$primary" "$sha" >/dev/null 2>&1; then
+            url="${primary%/}/$sha$ext"
+        else
+            local out
+            out=$(timeout "${CARNELIAN_UPLOAD_TIMEOUT:-300}" "${NAK[@]}" blossom upload -s "$primary" "$path" </dev/null) \
+                || die "upload of $(basename "$path") to $primary failed. Is Opal unlocked, and did you approve the Blossom request?"
+            url=$(jq -r 'select(.url != null) | .url' <<<"$out" | head -1)
+            [ -n "$url" ] || die "no URL in the server's reply for $(basename "$path"): $out"
+        fi
+        umask 077
+        mkdir -p "$CONFIG_DIR"
+        if [ -s "$UPLOADS_FILE" ]; then
+            jq --arg sha "$sha" --arg url "$url" '.[$sha] = $url' "$UPLOADS_FILE" >"$UPLOADS_FILE.tmp" && mv "$UPLOADS_FILE.tmp" "$UPLOADS_FILE"
+        else
+            jq -n --arg sha "$sha" --arg url "$url" '{($sha): $url}' >"$UPLOADS_FILE"
+        fi
+    fi
+
+    for s in "${servers[@]:1}"; do
+        if "${NAK[@]}" blossom check -s "$s" "$sha" >/dev/null 2>&1; then
+            continue
+        fi
+        if ! timeout "${CARNELIAN_UPLOAD_TIMEOUT:-300}" "${NAK[@]}" blossom mirror -s "$s" "$url" </dev/null >/dev/null 2>&1; then
+            echo "  Warning: could not mirror $(basename "$path") to $s" >&2
+        fi
+    done
+    printf '%s\n' "$url"
+}
+
+build_tag_args() {
+    local -n _args=$1
+    local title="$2" published_at="$3" summary="$4" image="$5"
+    shift 5
+    _args=(-t "title=$title" -t "published_at=$published_at")
+    [ -n "$summary" ] && _args+=(-t "summary=$summary")
+    [ -n "$image" ] && _args+=(-t "image=$image")
+    local t
+    for t in "$@"; do _args+=(-t "t=$t"); done
+}
+
 # --- publish ------------------------------------------------------------------
 
 cmd_publish() {
     need nak jq python3
 
-    local file="" dry_run=0 assume_yes=0 slug_override=""
-    local cli_relays=()
+    local file="" dry_run=0 assume_yes=0 slug_override="" rewrite_links=0
+    local cli_relays=() cli_servers=()
     while [ $# -gt 0 ]; do
         case "$1" in
             -h|--help) usage 0 ;;
             --dry-run) dry_run=1 ;;
             --yes|-y) assume_yes=1 ;;
+            --rewrite-links) rewrite_links=1 ;;
             --slug) slug_override="${2:-}"; shift ;;
             --slug=*) slug_override="${1#--slug=}" ;;
             --relay) cli_relays+=("${2:-}"); shift ;;
             --relay=*) cli_relays+=("${1#--relay=}") ;;
+            --server) cli_servers+=("${2:-}"); shift ;;
+            --server=*) cli_servers+=("${1#--server=}") ;;
             -*) die "unknown option: $1 (see --help)" ;;
             *)
                 [ -z "$file" ] || die "more than one file given: $file, $1"
@@ -363,9 +591,6 @@ cmd_publish() {
         esac
         shift
     done
-
-    [ ${#cli_relays[@]} -gt 0 ] && RELAYS=("${cli_relays[@]}")
-    [ ${#RELAYS[@]} -gt 0 ] || RELAYS=("${DEFAULT_RELAYS[@]}")
 
     if [ -z "$file" ]; then
         file=$(omawrite_open_file || true)
@@ -381,15 +606,21 @@ cmd_publish() {
         fi
     fi
     [ -f "$file" ] || die "file not found: $file"
+    file=$(realpath "$file")
+
+    maybe_refresh
+    local relays=() servers=()
+    resolve_relays relays "${cli_relays[@]}"
+    resolve_servers servers "${cli_servers[@]}"
 
     local tmp
     tmp=$(mktemp -d)
     # shellcheck disable=SC2064  # expand now: the trap runs after this local is gone
     trap "rm -rf '$tmp'" EXIT
-    local meta="$tmp/meta.json" body="$tmp/body.md"
+    local meta="$tmp/meta.json" body="$tmp/body.md" images="$tmp/images.json"
 
-    FILE="$file" META_FILE="$meta" BODY_FILE="$body" SLUG_OVERRIDE="$slug_override" python3 - <<'PYEOF'
-import datetime, json, os, re, sys, time
+    FILE="$file" META_FILE="$meta" BODY_FILE="$body" IMAGES_FILE="$images" SLUG_OVERRIDE="$slug_override" python3 - <<'PYEOF'
+import datetime, hashlib, json, os, re, sys, time
 import yaml
 
 path = os.environ["FILE"]
@@ -411,7 +642,7 @@ body = body.lstrip("\n")
 base = os.path.splitext(os.path.basename(path))[0]
 date_prefix = re.match(r"^(\d{4}-\d{2}-\d{2})-(.+)$", base)
 
-# Title: front matter, else the first H1, which is then removed from the body.
+# Title: front matter, else the first H1 (removed from the body), else the filename.
 h1 = re.match(r"^#[ \t]+(.+?)[ \t]*#*[ \t]*\n", body)
 title = str(meta.get("title") or "").strip()
 if h1:
@@ -420,7 +651,6 @@ if h1:
     if h1.group(1).strip() == title:
         body = body[h1.end():].lstrip("\n")
 if not title:
-    # No front matter title and no H1: fall back to the filename, prettified.
     stem = date_prefix.group(2) if date_prefix else base
     title = re.sub(r"[-_]+", " ", stem).strip().title()
     print(f"Note: no '# Heading' or front matter title found; using \"{title}\" from the filename.", file=sys.stderr)
@@ -479,7 +709,49 @@ if isinstance(tags, str):
 tags = [re.sub(r"^#", "", str(t)).strip().lower() for t in tags]
 tags = [t for t in dict.fromkeys(tags) if t]
 
+# Local images: markdown image links and the cover whose target is a file on
+# disk, relative to the markdown file. Remote URLs and nostr:/data: are left alone.
+IMG_RE = r"!\[[^\]]*\]\(\s*(<[^>]*>|[^)\s]+)(?:\s+\"[^\"]*\")?\s*\)"
+
+def is_remote(target):
+    return bool(re.match(r"^(https?:|nostr:|data:|blob:|//)", target, re.I))
+
+def local_path(target):
+    t = target.strip()
+    if t.startswith("<") and t.endswith(">"):
+        t = t[1:-1]
+    if t.startswith("file://"):
+        import urllib.parse
+        t = urllib.parse.unquote(t[7:])
+    if is_remote(t):
+        return None
+    t = os.path.expanduser(t)
+    return t if os.path.isabs(t) else os.path.normpath(os.path.join(os.path.dirname(path), t))
+
+images, seen, missing = [], {}, []
+def note(target):
+    if target in seen:
+        return
+    lp = local_path(target)
+    if lp is None:
+        return
+    if not os.path.isfile(lp):
+        missing.append(target)
+        return
+    h = hashlib.sha256(open(lp, "rb").read()).hexdigest()
+    ext = os.path.splitext(lp)[1].lower()
+    seen[target] = True
+    images.append({"target": target, "path": lp, "sha256": h, "ext": ext, "size": os.path.getsize(lp)})
+
+for mm in re.finditer(IMG_RE, body):
+    note(mm.group(1))
+if image:
+    note(image)
+if missing:
+    sys.exit("image file(s) not found: " + ", ".join(missing))
+
 open(os.environ["BODY_FILE"], "w", encoding="utf-8").write(body.rstrip() + "\n")
+json.dump(images, open(os.environ["IMAGES_FILE"], "w"))
 json.dump({"title": title, "slug": slug, "summary": summary, "image": image,
            "published_at": published_at, "tags": tags}, open(os.environ["META_FILE"], "w"))
 PYEOF
@@ -492,12 +764,8 @@ PYEOF
     published_at=$(jq -r '.published_at' "$meta")
     local hashtags=()
     mapfile -t hashtags < <(jq -r '.tags[]' "$meta")
-
-    local tag_args=(-t "title=$title" -t "published_at=$published_at")
-    [ -n "$summary" ] && tag_args+=(-t "summary=$summary")
-    [ -n "$image" ] && tag_args+=(-t "image=$image")
-    local t
-    for t in "${hashtags[@]}"; do tag_args+=(-t "t=$t"); done
+    local n_images
+    n_images=$(jq 'length' "$images")
 
     echo ""
     echo "=== Article ==="
@@ -509,6 +777,11 @@ PYEOF
     echo "Image:     ${image:-<none>}"
     echo "Hashtags:  ${hashtags[*]:-<none>}"
     echo "Body:      $(wc -w <"$body") words, $(wc -l <"$body") lines"
+    if [ "$n_images" -gt 0 ]; then
+        echo "Uploads:   $n_images local image(s) -> ${servers[*]:-<no Blossom servers>} ($SERVER_SOURCE)"
+        jq -r '.[] | "           \(.path) (\(.size) bytes)"' "$images"
+        [ ${#servers[@]} -gt 0 ] || die "this article has local images but no Blossom server is known. Publish a server list (kind 10063), set CARNELIAN_BLOSSOM_SERVERS, or pass --server."
+    fi
     echo ""
     echo "=== Body preview (first 20 lines) ==="
     head -20 "$body"
@@ -516,38 +789,89 @@ PYEOF
     echo ""
 
     if [ "$dry_run" -eq 1 ]; then
+        [ "$n_images" -gt 0 ] && echo "Dry run: images are not uploaded; links stay as written."
+        local tag_args
+        build_tag_args tag_args "$title" "$published_at" "$summary" "$image" "${hashtags[@]}"
         echo "=== Dry run: the event as it would be published (signed with a throwaway key) ==="
         env -u NOSTR_SECRET_KEY -u NOSTR_CLIENT_KEY \
-            nak --connect-timeout "${CARNELIAN_CONNECT_TIMEOUT:-10s}" event -k 30023 -d "$slug" "${tag_args[@]}" -c "@$body" </dev/null | jq .
+            "${NAK[@]}" event -k 30023 -d "$slug" "${tag_args[@]}" -c "@$body" </dev/null | jq .
         echo ""
-        echo "Relays that would receive it: ${RELAYS[*]}"
+        echo "Relays that would receive it: ${relays[*]} ($RELAY_SOURCE)"
         return 0
     fi
 
     local have_signer=1
     load_signer || have_signer=0
-    check_perms "$BUNKER_FILE"
-    check_perms "$CLIENT_KEY_FILE"
+    [ "$have_signer" -eq 1 ] || [ "$n_images" -eq 0 ] || die "uploading images needs a configured signer (carnelian setup, or NOSTR_SECRET_KEY)."
 
     echo "Signer: $SIGNER_DESC"
-    echo "Relays: ${RELAYS[*]}"
+    echo "Relays: ${relays[*]} ($RELAY_SOURCE)"
     if [ "$assume_yes" -ne 1 ]; then
         local reply
         read -r -p "Publish \"$title\" to Nostr? [y/N] " reply </dev/tty
         [[ "$reply" =~ ^[Yy]$ ]] || { echo "Aborted."; return 0; }
     fi
 
+    # Upload images and swap the links in the body (and the cover) for blob URLs.
+    if [ "$n_images" -gt 0 ]; then
+        echo "Uploading $n_images image(s) to ${servers[0]}..."
+        local mapping="$tmp/mapping.json" i target path sha ext url
+        echo '{}' >"$mapping"
+        for i in $(seq 0 $((n_images - 1))); do
+            target=$(jq -r ".[$i].target" "$images")
+            path=$(jq -r ".[$i].path" "$images")
+            sha=$(jq -r ".[$i].sha256" "$images")
+            ext=$(jq -r ".[$i].ext" "$images")
+            url=$(upload_image "$path" "$sha" "$ext" "${servers[@]}")
+            echo "  $(basename "$path") -> $url"
+            jq --arg t "$target" --arg u "$url" '.[$t] = $u' "$mapping" >"$mapping.tmp" && mv "$mapping.tmp" "$mapping"
+        done
+        MAPPING="$mapping" BODY_FILE="$body" python3 - <<'PYEOF'
+import json, os, re
+mapping = json.load(open(os.environ["MAPPING"]))
+p = os.environ["BODY_FILE"]
+body = open(p, encoding="utf-8").read()
+def swap(m):
+    target = m.group(1)
+    return m.group(0).replace(target, mapping.get(target, target), 1)
+body = re.sub(r"!\[[^\]]*\]\(\s*(<[^>]*>|[^)\s]+)(?:\s+\"[^\"]*\")?\s*\)", swap, body)
+open(p, "w", encoding="utf-8").write(body)
+PYEOF
+        if [ -n "$image" ]; then
+            image=$(jq -r --arg t "$image" '.[$t] // $t' "$mapping")
+        fi
+        if [ "$rewrite_links" -eq 1 ]; then
+            cp "$file" "$file.bak"
+            MAPPING="$mapping" SRC="$file" python3 - <<'PYEOF'
+import json, os, re
+mapping = json.load(open(os.environ["MAPPING"]))
+p = os.environ["SRC"]
+text = open(p, encoding="utf-8").read()
+for target, url in mapping.items():
+    text = text.replace(f"({target})", f"({url})").replace(f"(<{target}>)", f"({url})")
+    text = re.sub(r"^(image|cover):[ \t]*" + re.escape(target) + r"[ \t]*$", r"\1: " + url, text, flags=re.M)
+open(p, "w", encoding="utf-8").write(text)
+PYEOF
+            echo "  Wrote the Blossom URLs into $file (backup: $file.bak)"
+        fi
+    fi
+
+    local tag_args
+    build_tag_args tag_args "$title" "$published_at" "$summary" "$image" "${hashtags[@]}"
+
     echo "Publishing..."
     # nak treats a piped stdin as event input, so keep stdin off a pipe. The key
     # prompt reads the terminal directly.
+    local signed="$tmp/signed.json"
     if [ "$have_signer" -eq 1 ]; then
         if ! timeout "${CARNELIAN_PUBLISH_TIMEOUT:-120}" \
-            nak --connect-timeout "${CARNELIAN_CONNECT_TIMEOUT:-10s}" event -k 30023 -d "$slug" "${tag_args[@]}" -c "@$body" "${RELAYS[@]}" </dev/null; then
+            "${NAK[@]}" event -k 30023 -d "$slug" "${tag_args[@]}" -c "@$body" "${relays[@]}" </dev/null | tee "$signed"; then
             die "publishing failed or timed out. Is Opal unlocked, and did you answer its approval dialog?"
         fi
     else
-        nak event --prompt-sec -k 30023 -d "$slug" "${tag_args[@]}" -c "@$body" "${RELAYS[@]}" </dev/tty
+        nak event --prompt-sec -k 30023 -d "$slug" "${tag_args[@]}" -c "@$body" "${relays[@]}" </dev/tty | tee "$signed"
     fi
+    remember_pubkey "$(jq -r 'select(.pubkey != null) | .pubkey' "$signed" 2>/dev/null | head -1)"
 
     echo ""
     echo "Done. Published \"$title\" as kind 30023 with d=$slug."
@@ -558,6 +882,7 @@ PYEOF
 
 case "${1:-}" in
     setup) shift; cmd_setup "$@" ;;
+    refresh) shift; cmd_refresh "$@" ;;
     test) shift; cmd_test "$@" ;;
     status) shift; cmd_status "$@" ;;
     -h|--help) usage 0 ;;
