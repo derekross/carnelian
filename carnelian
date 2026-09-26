@@ -1,0 +1,436 @@
+#!/bin/bash
+
+# Carnelian: publish a markdown file to Nostr as a long-form article (NIP-23).
+#
+# Usage:
+#   carnelian [file.md] [options]     Publish a file, or the file open in Omawrite.
+#   carnelian setup [--policy P]      Pair with the Opal signer (NIP-46).
+#   carnelian status                  Show the signer and config in use.
+#
+# Options:
+#   --dry-run          Build and print the event; sign nothing, send nothing.
+#   --slug <slug>      Override the article slug (the NIP-33 "d" tag).
+#   --relay <url>      Publish to this relay instead of the configured ones. Repeatable.
+#   --yes, -y          Skip the confirmation prompt.
+#   -h, --help         This text.
+#
+# Metadata comes from optional YAML front matter:
+#
+#   ---
+#   title: Goodbye Dock
+#   summary: One paragraph shown in feeds.
+#   image: https://example.com/cover.png
+#   tags: [omarchy, linux]
+#   slug: omarchy-goodbye-dock
+#   date: 2026-09-23
+#   ---
+#
+# Fallbacks when a field is missing:
+#   title      the first "# Heading" in the file
+#   slug       the filename without a YYYY-MM-DD- prefix and the .md suffix
+#   date       the YYYY-MM-DD prefix of the filename, else now
+#   summary    the first paragraph after the title, trimmed to 300 characters
+#
+# The leading H1 is removed from the body because clients render the title
+# tag. Publishing the same slug again replaces the earlier version on relays,
+# so an edit is just a rerun.
+#
+# Signing, in order of preference:
+#   1. NOSTR_SECRET_KEY in the environment (nsec, hex, ncryptsec or bunker://)
+#   2. ~/.config/carnelian/bunker, written by `carnelian setup` (Opal, NIP-46)
+#   3. a key prompt from nak
+
+set -euo pipefail
+
+CONFIG_DIR="${CARNELIAN_CONFIG_DIR:-$HOME/.config/carnelian}"
+CONFIG_FILE="$CONFIG_DIR/config"
+BUNKER_FILE="$CONFIG_DIR/bunker"
+CLIENT_KEY_FILE="$CONFIG_DIR/client-key"
+OMAWRITE_STATE_DIR="$HOME/.local/share/Omacom/omawrite"
+APP_NAME="Carnelian"
+
+DEFAULT_RELAYS=(
+    "wss://relay.primal.net"
+    "wss://relay.damus.io"
+    "wss://relay.ditto.pub"
+    "wss://nos.lol"
+    "wss://relay.snort.social"
+)
+
+usage() {
+    sed -n '3,42p' "$0" | sed 's/^# \{0,1\}//'
+    exit "${1:-1}"
+}
+
+die() { echo "carnelian: $*" >&2; exit 1; }
+
+need() {
+    for cmd in "$@"; do
+        command -v "$cmd" >/dev/null 2>&1 || die "'$cmd' is required. $(install_hint "$cmd")"
+    done
+}
+
+install_hint() {
+    case "$1" in
+        nak) echo "Install it with: omarchy pkg aur add nak-bin" ;;
+        opal) echo "Install Opal from https://github.com/derekross/opal" ;;
+        *) echo "" ;;
+    esac
+}
+
+# --- Config -------------------------------------------------------------------
+
+RELAYS=()
+if [ -f "$CONFIG_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+    if [ -n "${CARNELIAN_RELAYS:-}" ]; then
+        read -r -a RELAYS <<<"$CARNELIAN_RELAYS"
+    fi
+fi
+
+# --- Signer -------------------------------------------------------------------
+
+# Exports NOSTR_SECRET_KEY (and NOSTR_CLIENT_KEY for bunkers) from the config
+# directory unless the environment already provides a key. Prints which one
+# is in use. Returns 1 when nothing is configured, in which case nak prompts.
+load_signer() {
+    if [ -n "${NOSTR_SECRET_KEY:-}" ]; then
+        case "$NOSTR_SECRET_KEY" in
+            bunker://*) SIGNER_DESC="bunker from the environment" ;;
+            *) SIGNER_DESC="key from the environment" ;;
+        esac
+        return 0
+    fi
+    if [ -s "$BUNKER_FILE" ]; then
+        NOSTR_SECRET_KEY=$(tr -d '[:space:]' <"$BUNKER_FILE")
+        export NOSTR_SECRET_KEY
+        if [ -s "$CLIENT_KEY_FILE" ]; then
+            NOSTR_CLIENT_KEY=$(tr -d '[:space:]' <"$CLIENT_KEY_FILE")
+            export NOSTR_CLIENT_KEY
+        fi
+        SIGNER_DESC="Opal (NIP-46) via $BUNKER_FILE"
+        return 0
+    fi
+    SIGNER_DESC="none configured; nak will prompt for a key"
+    return 1
+}
+
+check_perms() {
+    local f="$1" perms
+    [ -e "$f" ] || return 0
+    perms=$(stat -c %a "$f")
+    [ "$perms" = 600 ] || [ "$perms" = 400 ] || die "$f must be mode 600 (is $perms). Fix with: chmod 600 '$f'"
+}
+
+# --- setup --------------------------------------------------------------------
+
+cmd_setup() {
+    local policy="manual"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --policy) policy="${2:-}"; shift ;;
+            --policy=*) policy="${1#--policy=}" ;;
+            -h|--help) usage 0 ;;
+            *) die "unknown setup option: $1" ;;
+        esac
+        shift
+    done
+    need nak opal
+
+    umask 077
+    mkdir -p "$CONFIG_DIR"
+
+    if [ -s "$CLIENT_KEY_FILE" ]; then
+        echo "Client key:  keeping $CLIENT_KEY_FILE"
+    else
+        nak key generate | tr -d '[:space:]' >"$CLIENT_KEY_FILE"
+        chmod 600 "$CLIENT_KEY_FILE"
+        echo "Client key:  generated $CLIENT_KEY_FILE"
+    fi
+
+    if [ -s "$BUNKER_FILE" ]; then
+        echo "Bunker:      $BUNKER_FILE already exists."
+        echo "             Delete it and rerun setup to pair again (then revoke the old '$APP_NAME' in Opal)."
+    else
+        opal status >/dev/null 2>&1 || die "Opal is not running or not reachable. Start it, then rerun setup."
+        local out uri
+        out=$(opal bunker --name "$APP_NAME" --policy "$policy" 2>&1) || die "opal bunker failed: $out"
+        uri=$(grep -oE 'bunker://[^[:space:]"]+' <<<"$out" | head -1)
+        [ -n "$uri" ] || die "could not find a bunker:// link in opal's output: $out"
+        printf '%s\n' "$uri" >"$BUNKER_FILE"
+        chmod 600 "$BUNKER_FILE"
+        echo "Bunker:      wrote $BUNKER_FILE (policy: $policy)"
+    fi
+
+    if [ ! -f "$CONFIG_FILE" ]; then
+        cat >"$CONFIG_FILE" <<EOF
+# Carnelian configuration. Sourced by bash.
+# Relays to publish to, space separated. Leave unset for the defaults.
+# CARNELIAN_RELAYS="wss://relay.primal.net wss://relay.damus.io"
+EOF
+        chmod 600 "$CONFIG_FILE"
+        echo "Config:      wrote $CONFIG_FILE"
+    fi
+
+    echo ""
+    echo "Paired with Opal as '$APP_NAME'. The first publish opens Opal's approval"
+    echo "dialog; choose 'remember' there if you do not want to approve every article."
+    echo "Try it: carnelian --dry-run <file.md>"
+}
+
+# --- status -------------------------------------------------------------------
+
+cmd_status() {
+    load_signer || true
+    echo "Signer:  $SIGNER_DESC"
+    if [ -s "$CLIENT_KEY_FILE" ]; then
+        echo "Client:  $(nak key public "$(tr -d '[:space:]' <"$CLIENT_KEY_FILE")" 2>/dev/null || echo "$CLIENT_KEY_FILE")"
+    fi
+    echo "Relays:  ${RELAYS[*]:-${DEFAULT_RELAYS[*]}}"
+    if command -v opal >/dev/null 2>&1; then
+        echo "Opal:    $(opal status 2>/dev/null | head -1 | sed 's/^Signer: *//' || echo 'not reachable')"
+    fi
+    local open
+    open=$(omawrite_open_file 2>/dev/null || true)
+    echo "Omawrite: ${open:-nothing open}"
+}
+
+# --- Omawrite -----------------------------------------------------------------
+
+omawrite_newest_state() {
+    ls -t "$OMAWRITE_STATE_DIR"/recovery-*.json 2>/dev/null | head -1
+}
+
+omawrite_open_file() {
+    local newest
+    newest=$(omawrite_newest_state)
+    [ -n "$newest" ] || return 1
+    jq -r '.fileUrl // empty' "$newest" | python3 -c '
+import sys, urllib.parse
+url = sys.stdin.read().strip()
+if url.startswith("file://"):
+    print(urllib.parse.unquote(url[len("file://"):]))
+'
+}
+
+omawrite_buffer_matches_disk() {
+    python3 - "$1" "$2" <<'PY'
+import json, sys
+buf = json.load(open(sys.argv[1])).get("text", "")
+disk = open(sys.argv[2], encoding="utf-8").read()
+sys.exit(0 if buf.rstrip() == disk.rstrip() else 1)
+PY
+}
+
+# --- publish ------------------------------------------------------------------
+
+cmd_publish() {
+    need nak jq python3
+
+    local file="" dry_run=0 assume_yes=0 slug_override=""
+    local cli_relays=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) usage 0 ;;
+            --dry-run) dry_run=1 ;;
+            --yes|-y) assume_yes=1 ;;
+            --slug) slug_override="${2:-}"; shift ;;
+            --slug=*) slug_override="${1#--slug=}" ;;
+            --relay) cli_relays+=("${2:-}"); shift ;;
+            --relay=*) cli_relays+=("${1#--relay=}") ;;
+            -*) die "unknown option: $1 (see --help)" ;;
+            *)
+                [ -z "$file" ] || die "more than one file given: $file, $1"
+                file="$1"
+                ;;
+        esac
+        shift
+    done
+
+    [ ${#cli_relays[@]} -gt 0 ] && RELAYS=("${cli_relays[@]}")
+    [ ${#RELAYS[@]} -gt 0 ] || RELAYS=("${DEFAULT_RELAYS[@]}")
+
+    if [ -z "$file" ]; then
+        file=$(omawrite_open_file || true)
+        [ -n "$file" ] || die "no file given and Omawrite has no saved file open. Usage: carnelian <file.md>"
+        echo "Using the file open in Omawrite: $file"
+        if ! omawrite_buffer_matches_disk "$(omawrite_newest_state)" "$file"; then
+            echo "Warning: Omawrite has unsaved changes. Save (Ctrl+S) and rerun to publish them." >&2
+        fi
+    fi
+    [ -f "$file" ] || die "file not found: $file"
+
+    local tmp
+    tmp=$(mktemp -d)
+    # shellcheck disable=SC2064  # expand now: the trap runs after this local is gone
+    trap "rm -rf '$tmp'" EXIT
+    local meta="$tmp/meta.json" body="$tmp/body.md"
+
+    FILE="$file" META_FILE="$meta" BODY_FILE="$body" SLUG_OVERRIDE="$slug_override" python3 - <<'PYEOF'
+import datetime, json, os, re, sys, time
+import yaml
+
+path = os.environ["FILE"]
+text = open(path, encoding="utf-8").read()
+
+meta, body = {}, text
+m = re.match(r"^---[ \t]*\n(.*?)\n---[ \t]*\n?", text, re.DOTALL)
+if m:
+    try:
+        loaded = yaml.safe_load(m.group(1)) or {}
+    except yaml.YAMLError as e:
+        sys.exit(f"front matter is not valid YAML: {e}")
+    if not isinstance(loaded, dict):
+        sys.exit("front matter must be a YAML mapping")
+    meta = {str(k).lower(): v for k, v in loaded.items()}
+    body = text[m.end():]
+body = body.lstrip("\n")
+
+# Title: front matter, else the first H1, which is then removed from the body.
+h1 = re.match(r"^#[ \t]+(.+?)[ \t]*#*[ \t]*\n", body)
+title = str(meta.get("title") or "").strip()
+if h1:
+    if not title:
+        title = h1.group(1).strip()
+    if h1.group(1).strip() == title:
+        body = body[h1.end():].lstrip("\n")
+if not title:
+    sys.exit("no title: add 'title:' to the front matter or start the file with an H1")
+
+# Slug: --slug, front matter, else the filename minus a date prefix.
+base = os.path.splitext(os.path.basename(path))[0]
+date_prefix = re.match(r"^(\d{4}-\d{2}-\d{2})-(.+)$", base)
+slug = os.environ.get("SLUG_OVERRIDE") or str(meta.get("slug") or "").strip()
+if not slug:
+    slug = date_prefix.group(2) if date_prefix else base
+slug = re.sub(r"[^a-z0-9]+", "-", slug.lower()).strip("-")
+if not slug:
+    sys.exit("could not derive a slug; pass --slug")
+
+# Published date: front matter, else the filename prefix, else now.
+raw = meta.get("published_at") or meta.get("date")
+if raw is None and date_prefix:
+    raw = date_prefix.group(1)
+if raw is None:
+    published_at = int(time.time())
+elif isinstance(raw, int):
+    published_at = raw
+else:
+    if isinstance(raw, datetime.datetime):
+        dt = raw
+    elif isinstance(raw, datetime.date):
+        dt = datetime.datetime(raw.year, raw.month, raw.day, 12, 0)
+    else:
+        s = str(raw).strip()
+        try:
+            dt = datetime.datetime.fromisoformat(s)
+        except ValueError:
+            sys.exit(f"could not parse date {s!r}; use YYYY-MM-DD")
+        if len(s) == 10:
+            dt = dt.replace(hour=12)
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    published_at = int(dt.timestamp())
+
+# Summary: front matter, else the first plain paragraph.
+summary = str(meta.get("summary") or meta.get("description") or meta.get("excerpt") or "").strip()
+if not summary:
+    for para in re.split(r"\n\s*\n", body):
+        p = para.strip()
+        if p and not p.startswith(("#", "!", "```", "<", "-", "*", ">")):
+            p = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", p)
+            p = re.sub(r"[*_`]", "", p)
+            summary = re.sub(r"\s+", " ", p)
+            if len(summary) > 300:
+                summary = summary[:297].rsplit(" ", 1)[0] + "..."
+            break
+
+image = str(meta.get("image") or meta.get("cover") or "").strip()
+
+tags = meta.get("tags") or []
+if isinstance(tags, str):
+    tags = [t for t in re.split(r"[,\s]+", tags) if t]
+tags = [re.sub(r"^#", "", str(t)).strip().lower() for t in tags]
+tags = [t for t in dict.fromkeys(tags) if t]
+
+open(os.environ["BODY_FILE"], "w", encoding="utf-8").write(body.rstrip() + "\n")
+json.dump({"title": title, "slug": slug, "summary": summary, "image": image,
+           "published_at": published_at, "tags": tags}, open(os.environ["META_FILE"], "w"))
+PYEOF
+
+    local title slug summary image published_at
+    title=$(jq -r '.title' "$meta")
+    slug=$(jq -r '.slug' "$meta")
+    summary=$(jq -r '.summary' "$meta")
+    image=$(jq -r '.image' "$meta")
+    published_at=$(jq -r '.published_at' "$meta")
+    local hashtags=()
+    mapfile -t hashtags < <(jq -r '.tags[]' "$meta")
+
+    local tag_args=(-t "title=$title" -t "published_at=$published_at")
+    [ -n "$summary" ] && tag_args+=(-t "summary=$summary")
+    [ -n "$image" ] && tag_args+=(-t "image=$image")
+    local t
+    for t in "${hashtags[@]}"; do tag_args+=(-t "t=$t"); done
+
+    echo ""
+    echo "=== Article ==="
+    echo "File:      $file"
+    echo "Title:     $title"
+    echo "Slug (d):  $slug"
+    echo "Date:      $(date -d "@$published_at" '+%Y-%m-%d %H:%M %Z') ($published_at)"
+    echo "Summary:   ${summary:-<none>}"
+    echo "Image:     ${image:-<none>}"
+    echo "Hashtags:  ${hashtags[*]:-<none>}"
+    echo "Body:      $(wc -w <"$body") words, $(wc -l <"$body") lines"
+    echo ""
+    echo "=== Body preview (first 20 lines) ==="
+    head -20 "$body"
+    echo "..."
+    echo ""
+
+    if [ "$dry_run" -eq 1 ]; then
+        echo "=== Dry run: the event as it would be published (signed with a throwaway key) ==="
+        env -u NOSTR_SECRET_KEY -u NOSTR_CLIENT_KEY \
+            nak event -k 30023 -d "$slug" "${tag_args[@]}" -c "@$body" </dev/null | jq .
+        echo ""
+        echo "Relays that would receive it: ${RELAYS[*]}"
+        return 0
+    fi
+
+    local have_signer=1
+    load_signer || have_signer=0
+    check_perms "$BUNKER_FILE"
+    check_perms "$CLIENT_KEY_FILE"
+
+    echo "Signer: $SIGNER_DESC"
+    echo "Relays: ${RELAYS[*]}"
+    if [ "$assume_yes" -ne 1 ]; then
+        local reply
+        read -r -p "Publish \"$title\" to Nostr? [y/N] " reply </dev/tty
+        [[ "$reply" =~ ^[Yy]$ ]] || { echo "Aborted."; return 0; }
+    fi
+
+    echo "Publishing..."
+    # nak treats a piped stdin as event input, so keep stdin off a pipe. The key
+    # prompt reads the terminal directly.
+    if [ "$have_signer" -eq 1 ]; then
+        nak event -k 30023 -d "$slug" "${tag_args[@]}" -c "@$body" "${RELAYS[@]}" </dev/null
+    else
+        nak event --prompt-sec -k 30023 -d "$slug" "${tag_args[@]}" -c "@$body" "${RELAYS[@]}" </dev/tty
+    fi
+
+    echo ""
+    echo "Done. Published \"$title\" as kind 30023 with d=$slug."
+    echo "Rerun after edits to replace it."
+}
+
+# --- main ---------------------------------------------------------------------
+
+case "${1:-}" in
+    setup) shift; cmd_setup "$@" ;;
+    status) shift; cmd_status "$@" ;;
+    -h|--help) usage 0 ;;
+    *) cmd_publish "$@" ;;
+esac

@@ -1,0 +1,5 @@
+  // Carnelian: publish the Omawrite draft to Nostr. Only shown while Omawrite
+  // is the focused window. Installed by dist/install.sh.
+  "trigger.share.carnelian": {"icon":"","label":"Publish to Nostr","description":"Long-form article (NIP-23) via Carnelian","when":"hyprctl activewindow -j | jq -e '.class == \"omawrite\"' >/dev/null"},
+  "trigger.share.carnelian.publish": {"icon":"","label":"Publish","description":"Preview, confirm, sign with Opal, send","action":"omarchy-launch-floating-terminal-with-presentation carnelian"},
+  "trigger.share.carnelian.dry-run": {"icon":"","label":"Dry run","description":"Show the event without signing or sending","action":"omarchy-launch-floating-terminal-with-presentation carnelian --dry-run"},
