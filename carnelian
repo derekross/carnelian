@@ -4,8 +4,10 @@
 #
 # Usage:
 #   carnelian [file.md] [options]     Publish a file, or the file open in Omawrite.
-#   carnelian setup [--policy P]      Pair with the Opal signer (NIP-46).
-#   carnelian status                  Show the signer and config in use.
+#   carnelian setup [--policy P] [--relay URL]...
+#                                   Pair with the Opal signer (NIP-46).
+#   carnelian test                  Sign a throwaway note through the signer; send nothing.
+#   carnelian status                Show the signer and config in use.
 #
 # Options:
 #   --dry-run          Build and print the event; sign nothing, send nothing.
@@ -55,6 +57,14 @@ DEFAULT_RELAYS=(
     "wss://relay.ditto.pub"
     "wss://nos.lol"
     "wss://relay.snort.social"
+)
+
+# Relays the signer and Carnelian talk over (NIP-46). Small, reliable, and
+# known to accept kind 24133. Override with `carnelian setup --relay`.
+SIGNER_RELAYS=(
+    "wss://relay.ditto.pub"
+    "wss://relay.dreamith.to"
+    "wss://relay.primal.net"
 )
 
 usage() {
@@ -114,7 +124,7 @@ prune_bunker_relays() {
     tmp=$(mktemp -d)
     for i in "${!relays[@]}"; do
         decoded=$(python3 -c 'import sys,urllib.parse; print(urllib.parse.unquote(sys.argv[1]))' "${relays[$i]#relay=}")
-        ( timeout "${CARNELIAN_RELAY_PROBE_SECONDS:-6}" nak req -k 24133 --limit 1 "$decoded" >/dev/null 2>&1 \
+        ( timeout "${CARNELIAN_RELAY_PROBE_SECONDS:-15}" nak --connect-timeout "${CARNELIAN_CONNECT_TIMEOUT:-10s}" req -k 24133 --limit 1 "$decoded" >/dev/null 2>&1 \
             && touch "$tmp/$i" ) &
         pids+=($!)
     done
@@ -171,10 +181,13 @@ check_perms() {
 
 cmd_setup() {
     local policy="manual"
+    local signer_relays=()
     while [ $# -gt 0 ]; do
         case "$1" in
             --policy) policy="${2:-}"; shift ;;
             --policy=*) policy="${1#--policy=}" ;;
+            --relay) signer_relays+=("${2:-}"); shift ;;
+            --relay=*) signer_relays+=("${1#--relay=}") ;;
             -h|--help) usage 0 ;;
             *) die "unknown setup option: $1" ;;
         esac
@@ -199,7 +212,10 @@ cmd_setup() {
     else
         opal status >/dev/null 2>&1 || die "Opal is not running or not reachable. Start it, then rerun setup."
         local out uri
-        out=$(opal bunker --name "$APP_NAME" --policy "$policy" 2>&1) || die "opal bunker failed: $out"
+        [ ${#signer_relays[@]} -gt 0 ] || signer_relays=("${SIGNER_RELAYS[@]}")
+        local relay_args=() r
+        for r in "${signer_relays[@]}"; do relay_args+=(--relay "$r"); done
+        out=$(opal bunker --name "$APP_NAME" --policy "$policy" "${relay_args[@]}" 2>&1) || die "opal bunker failed: $out"
         uri=$(grep -oE 'bunker://[^[:space:]"]+' <<<"$out" | head -1)
         [ -n "$uri" ] || die "could not find a bunker:// link in opal's output: $out"
         echo "Checking the signer relays..."
@@ -207,6 +223,7 @@ cmd_setup() {
         printf '%s\n' "$uri" >"$BUNKER_FILE"
         chmod 600 "$BUNKER_FILE"
         echo "Bunker:      wrote $BUNKER_FILE (policy: $policy)"
+        echo "Relays:      ${signer_relays[*]}"
     fi
 
     if [ ! -f "$CONFIG_FILE" ]; then
@@ -222,7 +239,27 @@ EOF
     echo ""
     echo "Paired with Opal as '$APP_NAME'. The first publish opens Opal's approval"
     echo "dialog; choose 'remember' there if you do not want to approve every article."
-    echo "Try it: carnelian --dry-run <file.md>"
+    echo "Try it: carnelian test"
+}
+
+# --- test ---------------------------------------------------------------------
+
+cmd_test() {
+    need nak
+    load_signer || die "no signer configured. Run: carnelian setup"
+    check_perms "$BUNKER_FILE"
+    check_perms "$CLIENT_KEY_FILE"
+    echo "Signer: $SIGNER_DESC"
+    echo "Asking the signer for a signature on a throwaway note. Nothing is sent to any relay."
+    local out
+    if ! out=$(timeout "${CARNELIAN_PUBLISH_TIMEOUT:-120}" \
+            nak --connect-timeout "${CARNELIAN_CONNECT_TIMEOUT:-10s}" event -k 1 -c "Carnelian signer test $(date +%s) (never published)" </dev/null); then
+        die "the signer did not answer. Is Opal unlocked, and did you approve the request?"
+    fi
+    local pk
+    pk=$(jq -r '.pubkey' <<<"$out")
+    echo "Signed by: $(nak encode npub "$pk" 2>/dev/null || echo "$pk")"
+    echo "OK: the signer works."
 }
 
 # --- status -------------------------------------------------------------------
@@ -239,34 +276,67 @@ cmd_status() {
     fi
     local open
     open=$(omawrite_open_file 2>/dev/null || true)
-    echo "Omawrite: ${open:-nothing open}"
+    echo "Omawrite: ${open:-nothing open}$(omawrite_is_modified && echo ' (unsaved changes)')"
 }
 
 # --- Omawrite -----------------------------------------------------------------
+#
+# Omawrite only writes recovery-N.json while a document has unsaved changes, so
+# the open file has to come from the window title ("* name.md - Omawrite" when
+# modified) plus Omawrite's last save directory.
 
-omawrite_newest_state() {
-    ls -t "$OMAWRITE_STATE_DIR"/recovery-*.json 2>/dev/null | head -1
+OMAWRITE_CONF="$HOME/.config/Omacom/omawrite.conf"
+
+omawrite_title() {
+    local active
+    active=$(hyprctl activewindow -j 2>/dev/null | jq -r 'select(.class == "omawrite") | .title // empty')
+    if [ -z "$active" ]; then
+        active=$(hyprctl clients -j 2>/dev/null | jq -r '[.[] | select(.class == "omawrite")] | sort_by(-.focusHistoryID) | last | .title // empty')
+    fi
+    printf '%s' "$active"
+}
+
+omawrite_is_modified() {
+    [[ "$(omawrite_title)" == "* "* ]]
 }
 
 omawrite_open_file() {
-    local newest
-    newest=$(omawrite_newest_state)
-    [ -n "$newest" ] || return 1
-    jq -r '.fileUrl // empty' "$newest" | python3 -c '
-import sys, urllib.parse
-url = sys.stdin.read().strip()
-if url.startswith("file://"):
-    print(urllib.parse.unquote(url[len("file://"):]))
-'
-}
+    local title base dir candidate newest
+    title=$(omawrite_title)
+    [ -n "$title" ] || return 1
+    base="${title#\* }"
+    base="${base% - Omawrite}"
+    [ -n "$base" ] && [ "$base" != "Untitled.md" ] || return 1
 
-omawrite_buffer_matches_disk() {
-    python3 - "$1" "$2" <<'PY'
-import json, sys
-buf = json.load(open(sys.argv[1])).get("text", "")
-disk = open(sys.argv[2], encoding="utf-8").read()
-sys.exit(0 if buf.rstrip() == disk.rstrip() else 1)
-PY
+    # 1. The directory Omawrite last saved into.
+    dir=$(sed -n 's/^lastSaveDirectory=//p' "$OMAWRITE_CONF" 2>/dev/null | head -1)
+    if [ -n "$dir" ] && [ -f "$dir/$base" ]; then
+        printf '%s\n' "$dir/$base"
+        return 0
+    fi
+
+    # 2. A recovery file for an unsaved edit of a saved document.
+    for candidate in "$OMAWRITE_STATE_DIR"/recovery-*.json; do
+        [ -f "$candidate" ] || continue
+        candidate=$(jq -r '.fileUrl // empty' "$candidate" | python3 -c '
+import sys, urllib.parse
+u = sys.stdin.read().strip()
+print(urllib.parse.unquote(u[7:]) if u.startswith("file://") else "")')
+        if [ -n "$candidate" ] && [ "$(basename "$candidate")" = "$base" ] && [ -f "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    # 3. The newest file of that name under the home directory.
+    newest=$(find "$HOME" -maxdepth 6 -type f -name "$base" \
+        -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/.cache/*' \
+        -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+    if [ -n "$newest" ]; then
+        printf '%s\n' "$newest"
+        return 0
+    fi
+    return 1
 }
 
 # --- publish ------------------------------------------------------------------
@@ -299,9 +369,14 @@ cmd_publish() {
 
     if [ -z "$file" ]; then
         file=$(omawrite_open_file || true)
-        [ -n "$file" ] || die "no file given and Omawrite has no saved file open. Usage: carnelian <file.md>"
+        if [ -z "$file" ]; then
+            if [ -n "$(omawrite_title)" ]; then
+                die "Omawrite's document has not been saved yet. Save it (Ctrl+S), then publish."
+            fi
+            die "no file given and no Omawrite window found. Usage: carnelian <file.md>"
+        fi
         echo "Using the file open in Omawrite: $file"
-        if ! omawrite_buffer_matches_disk "$(omawrite_newest_state)" "$file"; then
+        if omawrite_is_modified; then
             echo "Warning: Omawrite has unsaved changes. Save (Ctrl+S) and rerun to publish them." >&2
         fi
     fi
@@ -333,6 +408,9 @@ if m:
     body = text[m.end():]
 body = body.lstrip("\n")
 
+base = os.path.splitext(os.path.basename(path))[0]
+date_prefix = re.match(r"^(\d{4}-\d{2}-\d{2})-(.+)$", base)
+
 # Title: front matter, else the first H1, which is then removed from the body.
 h1 = re.match(r"^#[ \t]+(.+?)[ \t]*#*[ \t]*\n", body)
 title = str(meta.get("title") or "").strip()
@@ -342,11 +420,12 @@ if h1:
     if h1.group(1).strip() == title:
         body = body[h1.end():].lstrip("\n")
 if not title:
-    sys.exit("no title: add 'title:' to the front matter or start the file with an H1")
+    # No front matter title and no H1: fall back to the filename, prettified.
+    stem = date_prefix.group(2) if date_prefix else base
+    title = re.sub(r"[-_]+", " ", stem).strip().title()
+    print(f"Note: no '# Heading' or front matter title found; using \"{title}\" from the filename.", file=sys.stderr)
 
 # Slug: --slug, front matter, else the filename minus a date prefix.
-base = os.path.splitext(os.path.basename(path))[0]
-date_prefix = re.match(r"^(\d{4}-\d{2}-\d{2})-(.+)$", base)
 slug = os.environ.get("SLUG_OVERRIDE") or str(meta.get("slug") or "").strip()
 if not slug:
     slug = date_prefix.group(2) if date_prefix else base
@@ -439,7 +518,7 @@ PYEOF
     if [ "$dry_run" -eq 1 ]; then
         echo "=== Dry run: the event as it would be published (signed with a throwaway key) ==="
         env -u NOSTR_SECRET_KEY -u NOSTR_CLIENT_KEY \
-            nak event -k 30023 -d "$slug" "${tag_args[@]}" -c "@$body" </dev/null | jq .
+            nak --connect-timeout "${CARNELIAN_CONNECT_TIMEOUT:-10s}" event -k 30023 -d "$slug" "${tag_args[@]}" -c "@$body" </dev/null | jq .
         echo ""
         echo "Relays that would receive it: ${RELAYS[*]}"
         return 0
@@ -463,7 +542,7 @@ PYEOF
     # prompt reads the terminal directly.
     if [ "$have_signer" -eq 1 ]; then
         if ! timeout "${CARNELIAN_PUBLISH_TIMEOUT:-120}" \
-            nak event -k 30023 -d "$slug" "${tag_args[@]}" -c "@$body" "${RELAYS[@]}" </dev/null; then
+            nak --connect-timeout "${CARNELIAN_CONNECT_TIMEOUT:-10s}" event -k 30023 -d "$slug" "${tag_args[@]}" -c "@$body" "${RELAYS[@]}" </dev/null; then
             die "publishing failed or timed out. Is Opal unlocked, and did you answer its approval dialog?"
         fi
     else
@@ -479,6 +558,7 @@ PYEOF
 
 case "${1:-}" in
     setup) shift; cmd_setup "$@" ;;
+    test) shift; cmd_test "$@" ;;
     status) shift; cmd_status "$@" ;;
     -h|--help) usage 0 ;;
     *) cmd_publish "$@" ;;

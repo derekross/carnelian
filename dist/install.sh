@@ -28,9 +28,13 @@ echo "Linked $BIN_DIR/carnelian -> $ROOT/carnelian"
 
 # Share menu entries. The menu file is JSONC with comments, so the entries
 # are inserted as text before the closing brace, once.
-if [[ -f $MENU ]] && grep -q '"trigger.share.carnelian"' "$MENU"; then
-    echo "Share menu entries already present in $MENU"
-elif [[ -f $MENU ]]; then
+if [[ -f $MENU ]] && grep -q '"trigger.share.carnelian' "$MENU"; then
+    # Refresh entries from an earlier install: drop ours, then insert the current ones.
+    cp "$MENU" "$MENU.bak.carnelian"
+    grep -v -E '"trigger\.share\.carnelian|Carnelian: publish the Omawrite|is the focused window\. Installed by dist/install\.sh' "$MENU" >"$MENU.tmp"
+    mv "$MENU.tmp" "$MENU"
+fi
+if [[ -f $MENU ]]; then
     cp "$MENU" "$MENU.bak.carnelian"
     python3 - "$MENU" dist/omarchy-menu.jsonc <<'PY'
 import sys
@@ -47,7 +51,7 @@ else:
     body = head + ",\n"
 open(menu, "w").write(body + entries + text[end:])
 PY
-    echo "Added Publish to Nostr to the Share menu ($MENU, backup at $MENU.bak.carnelian)"
+    echo "Installed Publish to Nostr in the Share menu ($MENU, backup at $MENU.bak.carnelian)"
 else
     mkdir -p "$(dirname "$MENU")"
     { echo "{"; cat dist/omarchy-menu.jsonc; echo "}"; } >"$MENU"

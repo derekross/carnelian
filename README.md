@@ -25,6 +25,8 @@ carnelian setup
 
 `carnelian setup` asks Opal for a `bunker://` link, stores it with a dedicated client key under `~/.config/carnelian/` (mode 600), and Carnelian appears in Opal's Apps list as its own app. The default policy is *manual*, so the first publish opens Opal's approval dialog with the article in it; tick "remember" there if you would rather not approve every post.
 
+The signer and Carnelian talk over relay.ditto.pub, relay.dreamith.to and relay.primal.net. Pass `--relay` to setup to use others. `carnelian test` asks the signer for a signature on a throwaway note that is never sent, so you can confirm the pairing before publishing anything.
+
 ## Use
 
 From Omawrite, press **Super + Ctrl + S** and pick **Publish to Nostr**:
@@ -40,13 +42,14 @@ carnelian post.md                    # preview, confirm, publish
 carnelian                            # the file open in Omawrite
 carnelian post.md --slug my-slug --relay wss://relay.example.com
 carnelian status                     # which signer, relays and file are in play
+carnelian test                       # sign a throwaway note through Opal; send nothing
 ```
 
-If Omawrite has changes you have not saved, Carnelian says so and publishes what is on disk, so save first.
+Carnelian finds the open document through Omawrite's window title and last save directory. If the document has never been saved, it asks you to save first; if it has unsaved changes, it says so and publishes what is on disk.
 
 ## Metadata
 
-Front matter is optional. With none, the title is the first `# Heading`, the slug is the filename minus a `YYYY-MM-DD-` prefix, the date is that prefix, and the summary is the first paragraph.
+Front matter is optional. With none, the title is the first `# Heading` (or, failing that, the filename prettified), the slug is the filename minus a `YYYY-MM-DD-` prefix, the date is that prefix, and the summary is the first paragraph.
 
 ```markdown
 ---
