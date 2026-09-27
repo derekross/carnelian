@@ -6,6 +6,8 @@ Carnelian is one bash script. It reads a markdown file, uploads any local images
 
 Named for the stone of signet rings, which sealed letters for a few thousand years before Nostr, and to sit beside Opal (signer) and Peridot (sharing) in the Omarchy bar.
 
+The story and a walkthrough: [Carnelian: Publish to Nostr Straight from Omawrite](https://njump.me/naddr1qvzqqqr4gupzq0mhp4ja8fmy48zuk5p6uy37vtk8tx9dqdwcxm32sy8nsaa8gkeyqq5xxctjdejkc6tpdckhqatzd35hx6pdw3hj6mn0wd68yttxwfhk6tt0d4shwunfw3jsfpv75n), published with Carnelian.
+
 ## Requirements
 
 - [Omarchy](https://omarchy.org) 4.x with Omawrite
