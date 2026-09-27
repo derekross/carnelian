@@ -743,8 +743,14 @@ def note(target):
     seen[target] = True
     images.append({"target": target, "path": lp, "sha256": h, "ext": ext, "size": os.path.getsize(lp)})
 
-for mm in re.finditer(IMG_RE, body):
-    note(mm.group(1))
+# Skip fenced code blocks and inline code: an image link shown as an example
+# is not an image to upload.
+CODE_RE = r"(```.*?```|~~~.*?~~~|`[^`\n]*`)"
+for segment in re.split(CODE_RE, body, flags=re.DOTALL):
+    if segment.startswith(("```", "~~~", "`")):
+        continue
+    for mm in re.finditer(IMG_RE, segment):
+        note(mm.group(1))
 if image:
     note(image)
 if missing:
@@ -834,8 +840,13 @@ body = open(p, encoding="utf-8").read()
 def swap(m):
     target = m.group(1)
     return m.group(0).replace(target, mapping.get(target, target), 1)
-body = re.sub(r"!\[[^\]]*\]\(\s*(<[^>]*>|[^)\s]+)(?:\s+\"[^\"]*\")?\s*\)", swap, body)
-open(p, "w", encoding="utf-8").write(body)
+IMG_RE = r"!\[[^\]]*\]\(\s*(<[^>]*>|[^)\s]+)(?:\s+\"[^\"]*\")?\s*\)"
+CODE_RE = r"(```.*?```|~~~.*?~~~|`[^`\n]*`)"
+parts = re.split(CODE_RE, body, flags=re.DOTALL)
+for i, seg in enumerate(parts):
+    if not seg.startswith(("```", "~~~", "`")):
+        parts[i] = re.sub(IMG_RE, swap, seg)
+open(p, "w", encoding="utf-8").write("".join(parts))
 PYEOF
         if [ -n "$image" ]; then
             image=$(jq -r --arg t "$image" '.[$t] // $t' "$mapping")
