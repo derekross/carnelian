@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "derekross.carnelian",
+  "name": "Carnelian",
+  "version": "0.4.0",
+  "author": "Derek Ross",
+  "license": "MIT",
+  "description": "Publish what you write in Omawrite to Nostr as a long-form article (NIP-23), from the Omarchy Share menu. Uploads local images to your Blossom servers and signs through Opal. Adds the command and menu entries: run dist/install.sh.",
+  "kinds": [
+    "service"
+  ],
+  "keepLoaded": false,
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}

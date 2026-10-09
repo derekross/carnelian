@@ -17,6 +17,20 @@ The story and a walkthrough: [Carnelian: Publish to Nostr Straight from Omawrite
 
 ## Install
 
+Carnelian is a command plus Share menu entries, packaged as an Omarchy plugin. `omarchy plugin add` only copies the plugin files, so the command and menu entries are installed with the included script.
+
+**With the Omarchy plugin command**
+
+```sh
+omarchy plugin add https://github.com/derekross/carnelian.git --enable
+~/.config/omarchy/plugins/derekross.carnelian/dist/install.sh
+carnelian setup
+```
+
+The plugin's only job inside the shell is to check that `install.sh` has run, and to remind you once per session if it hasn't.
+
+**Or from a clone**
+
 ```sh
 git clone https://github.com/derekross/carnelian ~/Projects/carnelian
 ~/Projects/carnelian/dist/install.sh
@@ -118,9 +132,11 @@ CARNELIAN_PUBKEY="npub1..."
 ## Uninstall
 
 ```sh
-~/Projects/carnelian/dist/uninstall.sh          # command and menu entries
-~/Projects/carnelian/dist/uninstall.sh --purge  # also the Opal pairing files
+~/.config/omarchy/plugins/derekross.carnelian/dist/uninstall.sh   # or ~/Projects/carnelian/dist/uninstall.sh in a clone
+omarchy plugin remove derekross.carnelian                        # if added with omarchy plugin add
 ```
+
+`uninstall.sh` removes the command and the menu entries. Add `--purge` to also delete the Opal pairing files in `~/.config/carnelian/`, then revoke Carnelian in Opal's Apps list.
 
 ## License
 
