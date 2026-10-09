@@ -225,7 +225,8 @@ pubkey_hex() {
         pk=$(opal status 2>/dev/null | grep -oE 'npub1[0-9a-z]+' | head -1 || true)
     fi
     if [ -z "$pk" ] && [ -n "${NOSTR_SECRET_KEY:-}" ] && [[ "$NOSTR_SECRET_KEY" != bunker://* ]]; then
-        pk=$(nak key public "$NOSTR_SECRET_KEY" 2>/dev/null || true)
+        # Through stdin, never argv: other users can read process arguments.
+        pk=$(printf '%s\n' "$NOSTR_SECRET_KEY" | nak key public 2>/dev/null || true)
     fi
     case "$pk" in
         npub1*) pk=$(nak decode "$pk" 2>/dev/null | grep -oE '[0-9a-f]{64}' | head -1 || true) ;;
@@ -427,7 +428,8 @@ cmd_status() {
     load_signer || true
     echo "Signer:   $SIGNER_DESC"
     if [ -s "$CLIENT_KEY_FILE" ]; then
-        echo "Client:   $(nak key public "$(tr -d '[:space:]' <"$CLIENT_KEY_FILE")" 2>/dev/null || echo "$CLIENT_KEY_FILE")"
+        # The key goes to nak through stdin, never argv.
+        echo "Client:   $( { tr -d '[:space:]' <"$CLIENT_KEY_FILE"; echo; } | nak key public 2>/dev/null || echo "$CLIENT_KEY_FILE")"
     fi
     local pk
     if pk=$(pubkey_hex); then
