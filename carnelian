@@ -10,6 +10,7 @@
 #                                   server list (BUD-03) and cache them.
 #   carnelian test                  Sign a throwaway note through the signer; send nothing.
 #   carnelian status                Show the signer, relays, servers and file in use.
+#   carnelian which                 Print the path of the file open in Omawrite.
 #
 # Options:
 #   --dry-run          Build and print the event; sign, upload and send nothing.
@@ -471,9 +472,14 @@ omawrite_is_modified() {
     [[ "$(omawrite_title)" == "* "* ]]
 }
 
+# Every Omawrite window title, most recently focused first.
+omawrite_titles() {
+    hyprctl clients -j 2>/dev/null | jq -r '[.[] | select(.class == "omawrite")] | sort_by(.focusHistoryID) | .[].title'
+}
+
 omawrite_open_file() {
-    local title base dir candidate newest
-    title=$(omawrite_title)
+    local title="${1:-}" base dir candidate newest
+    [ -n "$title" ] || title=$(omawrite_title)
     [ -n "$title" ] || return 1
     base="${title#\* }"
     base="${base% - Omawrite}"
@@ -508,6 +514,33 @@ print(urllib.parse.unquote(u[7:]) if u.startswith("file://") else "")')
         return 0
     fi
     return 1
+}
+
+# The file to publish when none is given. With one Omawrite window, that's its
+# document. With several, ask: focus follows the mouse, so by the time this
+# runs the focused window may not be the one the Share menu was opened from.
+omawrite_pick_file() {
+    local titles=() paths=() t p seen=" " choice
+    mapfile -t titles < <(omawrite_titles)
+    for t in "${titles[@]}"; do
+        p=$(omawrite_open_file "$t" 2>/dev/null) || continue
+        [[ "$seen" == *" $p "* ]] && continue
+        seen+="$p "
+        paths+=("$p")
+    done
+    [ ${#paths[@]} -gt 0 ] || return 1
+    if [ ${#paths[@]} -eq 1 ] || ! { : </dev/tty; } 2>/dev/null; then
+        printf '%s\n' "${paths[0]}"
+        return 0
+    fi
+    echo "Omawrite has ${#paths[@]} documents open. Which one should be published?" >/dev/tty
+    if command -v gum >/dev/null 2>&1; then
+        choice=$(gum choose "${paths[@]}" </dev/tty 2>/dev/tty) || return 2
+    else
+        select choice in "${paths[@]}"; do [ -n "$choice" ] && break; done </dev/tty 2>/dev/tty
+    fi
+    [ -n "$choice" ] || return 2
+    printf '%s\n' "$choice"
 }
 
 # --- Images -------------------------------------------------------------------
@@ -593,7 +626,9 @@ cmd_publish() {
     done
 
     if [ -z "$file" ]; then
-        file=$(omawrite_open_file || true)
+        local pick_status=0
+        file=$(omawrite_pick_file) || pick_status=$?
+        [ "$pick_status" -ne 2 ] || die "cancelled, nothing published."
         if [ -z "$file" ]; then
             if [ -n "$(omawrite_title)" ]; then
                 die "Omawrite's document has not been saved yet. Save it (Ctrl+S), then publish."
@@ -601,7 +636,7 @@ cmd_publish() {
             die "no file given and no Omawrite window found. Usage: carnelian <file.md>"
         fi
         echo "Using the file open in Omawrite: $file"
-        if omawrite_is_modified; then
+        if omawrite_titles | grep -qxF "* $(basename "$file") - Omawrite"; then
             echo "Warning: Omawrite has unsaved changes. Save (Ctrl+S) and rerun to publish them." >&2
         fi
     fi
@@ -896,6 +931,7 @@ case "${1:-}" in
     refresh) shift; cmd_refresh "$@" ;;
     test) shift; cmd_test "$@" ;;
     status) shift; cmd_status "$@" ;;
+    which) omawrite_open_file ;;
     -h|--help) usage 0 ;;
     *) cmd_publish "$@" ;;
 esac

@@ -44,12 +44,13 @@ carnelian post.md                    # preview, confirm, publish
 carnelian                            # the file open in Omawrite
 carnelian post.md --slug my-slug --relay wss://relay.example.com
 carnelian status                     # which signer, relays, servers and file are in play
+carnelian which                      # print the path of the file open in Omawrite
 carnelian test                       # sign a throwaway note through Opal; send nothing
 carnelian refresh                    # re-fetch your relay and Blossom server lists
 carnelian post.md --rewrite-links    # also write the Blossom URLs back into post.md
 ```
 
-Carnelian finds the open document through Omawrite's window title and last save directory. If the document has never been saved, it asks you to save first; if it has unsaved changes, it says so and publishes what is on disk.
+Carnelian finds the open document through Omawrite's window title and last save directory. If the document has never been saved, it asks you to save first; if it has unsaved changes, it says so and publishes what is on disk. With more than one Omawrite window open, it asks which document to publish, most recently focused first. It doesn't guess, because with focus following the mouse the focused window can change between opening the Share menu and the terminal starting.
 
 ## Metadata
 
