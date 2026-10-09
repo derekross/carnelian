@@ -588,15 +588,25 @@ upload_image() {
     printf '%s\n' "$url"
 }
 
-build_tag_args() {
-    local -n _args=$1
-    local title="$2" published_at="$3" summary="$4" image="$5"
-    shift 5
-    _args=(-t "title=$title" -t "published_at=$published_at")
-    [ -n "$summary" ] && _args+=(-t "summary=$summary")
-    [ -n "$image" ] && _args+=(-t "image=$image")
-    local t
-    for t in "$@"; do _args+=(-t "t=$t"); done
+# Write the unsigned event to a private file for nak to read on stdin. Nothing
+# from the draft goes on a command line, because other local users can read
+# process arguments. The cover image comes in through the environment because
+# uploading may have swapped it for a blob URL.
+write_event_template() {
+    local meta="$1" body="$2" image="$3" out="$4"
+    META_FILE="$meta" BODY_FILE="$body" IMAGE="$image" OUT_FILE="$out" python3 - <<'PYEOF'
+import json, os
+meta = json.load(open(os.environ["META_FILE"]))
+tags = [["d", meta["slug"]], ["title", meta["title"]], ["published_at", str(meta["published_at"])]]
+if meta.get("summary"):
+    tags.append(["summary", meta["summary"]])
+if os.environ.get("IMAGE"):
+    tags.append(["image", os.environ["IMAGE"]])
+tags += [["t", t] for t in meta.get("tags", [])]
+event = {"kind": 30023, "content": open(os.environ["BODY_FILE"], encoding="utf-8").read(), "tags": tags}
+with open(os.environ["OUT_FILE"], "w", encoding="utf-8") as f:
+    json.dump(event, f, ensure_ascii=False)
+PYEOF
 }
 
 # --- publish ------------------------------------------------------------------
@@ -833,11 +843,11 @@ PYEOF
 
     if [ "$dry_run" -eq 1 ]; then
         [ "$n_images" -gt 0 ] && echo "Dry run: images are not uploaded; links stay as written."
-        local tag_args
-        build_tag_args tag_args "$title" "$published_at" "$summary" "$image" "${hashtags[@]}"
+        local event="$tmp/event.json"
+        write_event_template "$meta" "$body" "$image" "$event"
         echo "=== Dry run: the event as it would be published (signed with a throwaway key) ==="
         env -u NOSTR_SECRET_KEY -u NOSTR_CLIENT_KEY \
-            "${NAK[@]}" event -k 30023 -d "$slug" "${tag_args[@]}" -c "@$body" </dev/null | jq .
+            "${NAK[@]}" event <"$event" | jq .
         echo ""
         echo "Relays that would receive it: ${relays[*]} ($RELAY_SOURCE)"
         return 0
@@ -904,20 +914,19 @@ PYEOF
         fi
     fi
 
-    local tag_args
-    build_tag_args tag_args "$title" "$published_at" "$summary" "$image" "${hashtags[@]}"
+    local event="$tmp/event.json"
+    write_event_template "$meta" "$body" "$image" "$event"
 
     echo "Publishing..."
-    # nak treats a piped stdin as event input, so keep stdin off a pipe. The key
-    # prompt reads the terminal directly.
+    # nak reads the unsigned event on stdin; the key prompt reads the terminal.
     local signed="$tmp/signed.json"
     if [ "$have_signer" -eq 1 ]; then
         if ! timeout "${CARNELIAN_PUBLISH_TIMEOUT:-120}" \
-            "${NAK[@]}" event -k 30023 -d "$slug" "${tag_args[@]}" -c "@$body" "${relays[@]}" </dev/null | tee "$signed"; then
+            "${NAK[@]}" event "${relays[@]}" <"$event" | tee "$signed"; then
             die "publishing failed or timed out. Is Opal unlocked, and did you answer its approval dialog?"
         fi
     else
-        nak event --prompt-sec -k 30023 -d "$slug" "${tag_args[@]}" -c "@$body" "${relays[@]}" </dev/tty | tee "$signed"
+        nak event --prompt-sec "${relays[@]}" <"$event" | tee "$signed"
     fi
     remember_pubkey "$(jq -r 'select(.pubkey != null) | .pubkey' "$signed" 2>/dev/null | head -1)"
 
